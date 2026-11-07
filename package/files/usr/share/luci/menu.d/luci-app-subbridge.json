@@ -1,0 +1,14 @@
+{
+	"admin/services/subbridge": {
+		"title": "SubBridge",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "subbridge/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-subbridge" ],
+			"uci": { "subbridge": true }
+		}
+	}
+}

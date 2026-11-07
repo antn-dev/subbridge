@@ -1,0 +1,7 @@
+#!/bin/sh
+# SubBridge command line entry point.
+#
+# The ucode modules live in /usr/lib/subbridge; -L tells ucode where to find
+# them. The LuCI page and the rpcd backend call exactly this binary, so there is
+# no second code path for the web interface.
+exec ucode -L /usr/lib/subbridge /usr/lib/subbridge/main.uc "$@"

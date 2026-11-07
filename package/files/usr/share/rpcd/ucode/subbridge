@@ -1,0 +1,529 @@
+// rpcd/ubus backend for SubBridge.
+//
+// The LuCI page talks to this object:
+//
+//   ubus call subbridge start    start a background check
+//   ubus call subbridge stop     stop the running check
+//   ubus call subbridge restart  reset the package runtime (no new check)
+//   ubus call subbridge status   read the progress document
+//   ubus call subbridge result   read the last successful result
+//   ubus call subbridge info     read settings and the detected engine
+//   ubus call subbridge save     store settings from the web form
+//
+// Long work happens in /usr/bin/subbridge, which owns the check lock and the
+// status/result files, so these calls return immediately and never block LuCI.
+
+import { popen, stat, mkdir, unlink, readfile, open, dirname } from 'fs';
+import { cursor } from 'uci';
+
+const STATE_DIR = '/tmp/subbridge';
+const STATUS_FILE = STATE_DIR + '/status.json';
+const RESULT_FILE = STATE_DIR + '/result.json';
+const LOG_FILE = STATE_DIR + '/check.log';
+const PID_FILE = STATE_DIR + '/check.pid';
+const LOCK_DIR = '/tmp/subbridge-check.lock';
+const BIN = '/usr/bin/subbridge';
+const INIT_SCRIPT = '/etc/init.d/subbridge';
+
+function shellquote(value) {
+	return "'" + replace('' + value, "'", "'\\''") + "'";
+}
+
+function trim(value) {
+	if (type(value) != 'string')
+		return '';
+
+	return replace(replace(value, /^\s+/, ''), /\s+$/, '');
+}
+
+/* Header values are passed to curl/uclient-fetch as separate -H arguments,
+ * but a stray newline would still split them into two headers. */
+function clean_header(value) {
+	value = trim('' + (value == null ? '' : value));
+	value = replace(value, /\r/g, '');
+	value = replace(value, /\n/g, '');
+
+	return value;
+}
+
+function ensure_dir(path) {
+	if (stat(path) == null)
+		mkdir(path, 0700);
+}
+
+function read_json(path, fallback) {
+	let data = readfile(path);
+
+	if (data == null || trim(data) == '')
+		return fallback;
+
+	try {
+		return json(data);
+	}
+	catch (e) {
+		return fallback;
+	}
+}
+
+function write_json(path, value) {
+	let dir = dirname(path);
+
+	if (dir != null && dir != '' && dir != '.' && stat(dir) == null)
+		mkdir(dir, 0700);
+
+	let f = open(path, 'w', 0600);
+	if (f != null) {
+		f.write(sprintf('%.4J\n', value));
+		f.close();
+	}
+}
+
+function settings() {
+	let ctx = cursor();
+
+	return {
+		enabled: ctx.get('subbridge', 'main', 'enabled') != '0',
+		subscription: ctx.get('subbridge', 'main', 'subscription') || '',
+		engine: ctx.get('subbridge', 'main', 'engine') || '',
+		test_url: ctx.get('subbridge', 'main', 'test_url') || '',
+		timeout_ms: int(ctx.get('subbridge', 'main', 'timeout_ms')) || 3000,
+		concurrency: int(ctx.get('subbridge', 'main', 'concurrency')) || 8,
+		hwid_file: ctx.get('subbridge', 'main', 'hwid_file') || '/etc/subbridge/hwid',
+		status_file: ctx.get('subbridge', 'main', 'status_file') || STATUS_FILE,
+		result_file: ctx.get('subbridge', 'main', 'result_file') || RESULT_FILE,
+		ua_mode: ctx.get('subbridge', 'main', 'ua_mode') == 'custom' ? 'custom' : 'auto',
+		ua_user_agent: ctx.get('subbridge', 'main', 'ua_user_agent') || 'Happ/6.1.0/linux catalyst/2610091518671',
+		ua_device_os: ctx.get('subbridge', 'main', 'ua_device_os') || 'Linux',
+		ua_ver_os: ctx.get('subbridge', 'main', 'ua_ver_os') || '6.6.0',
+		ua_app_version: ctx.get('subbridge', 'main', 'ua_app_version') || '6.1.0',
+		ua_device_model: ctx.get('subbridge', 'main', 'ua_device_model') || 'Linux PC',
+		ua_device_locale: ctx.get('subbridge', 'main', 'ua_device_locale') || 'ru',
+		ua_hwid: ctx.get('subbridge', 'main', 'ua_hwid') || ''
+	};
+}
+
+function detect_engine() {
+	for (let path in ['/usr/bin/sing-box', '/usr/local/bin/sing-box', '/opt/bin/sing-box', '/usr/libexec/sing-box']) {
+		if (stat(path) != null)
+			return path;
+	}
+
+	let p = popen('command -v sing-box 2>/dev/null');
+	if (p == null)
+		return '';
+
+	let found = trim(p.read('all'));
+	p.close();
+
+	return found;
+}
+
+function version() {
+	let value = trim(readfile('/usr/share/subbridge/version'));
+	return value == '' ? '0.4.14' : value;
+}
+
+function engine_version(binary) {
+	if (binary == '')
+		return '';
+
+	let p = popen(shellquote(binary) + ' version 2>&1');
+	if (p == null)
+		return '';
+
+	let output = p.read('all');
+	p.close();
+
+	for (let line in split(output, '\n')) {
+		line = trim(line);
+		if (line != '')
+			return line;
+	}
+
+	return '';
+}
+
+function clear_file(path) {
+	if (stat(path) != null)
+		unlink(path);
+}
+
+function write_text(path, text) {
+	let f = open(path, 'w', 0600);
+
+	if (f != null) {
+		f.write(text);
+		f.close();
+	}
+}
+
+function process_alive(pid) {
+	return pid > 0 && stat('/proc/' + pid) != null;
+}
+
+function read_pid() {
+	return int(trim(readfile(PID_FILE))) || 0;
+}
+
+function signal_pid(pid, signal) {
+	if (pid <= 0)
+		return;
+
+	let p = popen('kill -' + signal + ' ' + pid + ' 2>/dev/null');
+
+	if (p != null)
+		p.close();
+}
+
+/*
+ * Stop every sing-box process that belongs to SubBridge. The check normally
+ * closes its engine through a finally/catch path, but a TERM at the wrong
+ * moment can leave the temporary engine behind. The bracket in the pattern
+ * keeps pgrep from matching its own command line.
+ */
+function kill_engine_processes() {
+	for (let pattern in [
+		'[s]ing-box run -c /tmp/subbridge-check-',
+		'[s]ing-box check -c /tmp/subbridge-probe-'
+	]) {
+		let p = popen('pgrep -f ' + shellquote(pattern) + ' 2>/dev/null');
+
+		if (p == null)
+			continue;
+
+		let output = p.read('all');
+		p.close();
+
+		for (let line in split(output, '\n')) {
+			let pid = int(trim(line));
+
+			if (pid > 0)
+				signal_pid(pid, 'TERM');
+		}
+	}
+}
+
+function stop_check() {
+	let pid = read_pid();
+
+	if (process_alive(pid)) {
+		signal_pid(pid, 'TERM');
+
+		for (let i = 0; i < 30 && process_alive(pid); i++)
+			sleep(0.1);
+
+		if (process_alive(pid))
+			signal_pid(pid, 'KILL');
+	}
+
+	kill_engine_processes();
+	clear_file(PID_FILE);
+
+	if (stat(LOCK_DIR) != null) {
+		let p = popen('rmdir ' + shellquote(LOCK_DIR) + ' 2>/dev/null');
+
+		if (p != null)
+			p.close();
+	}
+}
+
+function run_command(command) {
+	let p = popen(command);
+
+	if (p == null)
+		return '';
+
+	let output = p.read('all');
+	p.close();
+
+	return output;
+}
+
+function service_running() {
+	if (stat(INIT_SCRIPT) == null)
+		return false;
+
+	/* The wrapper execs `ucode .../subbridge/main.uc daemon`; the bracket
+	 * keeps pgrep from matching its own command line. */
+	return trim(run_command("pgrep -f '[s]ubbridge/main.uc daemon' 2>/dev/null")) != '';
+}
+
+function service_action(action) {
+	if (stat(INIT_SCRIPT) == null)
+		return false;
+
+	run_command(shellquote(INIT_SCRIPT) + ' ' + action + ' >/dev/null 2>&1');
+	return true;
+}
+
+function set_enabled(request) {
+	let raw = request.args.enabled;
+	let on = !(raw === false || raw === 0 || raw == '0' || raw == 'false' || raw == 'off');
+	let ctx = cursor();
+	let cfg = settings();
+
+	ctx.set('subbridge', 'main', 'enabled', on ? '1' : '0');
+	ctx.commit('subbridge');
+
+	if (on) {
+		/* The package power state also controls autostart: enable the rc.d
+		 * link and start the procd service. It never starts a check. */
+		service_action('enable');
+		service_action('start');
+	}
+	else {
+		/* Switching the package off stops the service, terminates the
+		 * running check and drops its transient state. */
+		service_action('stop');
+		service_action('disable');
+		stop_check();
+		clear_file(cfg.result_file || RESULT_FILE);
+		write_json(cfg.status_file || STATUS_FILE, {
+			state: 'idle',
+			phase: '',
+			total: 0,
+			done: 0,
+			message: '',
+			updated: time()
+		});
+	}
+
+	return { ok: true, running: service_running(), enabled: on };
+}
+
+function start_check() {
+	let cfg = settings();
+	let statusFile = cfg.status_file || STATUS_FILE;
+	let resultFile = cfg.result_file || RESULT_FILE;
+
+	if (!cfg.enabled)
+		return { started: false, running: false, error: 'SubBridge is disabled' };
+
+	ensure_dir(STATE_DIR);
+
+	if (stat(LOCK_DIR) != null)
+		return { started: false, running: true };
+
+	clear_file(resultFile);
+
+	write_json(statusFile, {
+		state: 'starting',
+		phase: '',
+		total: 0,
+		done: 0,
+		message: '',
+		updated: time()
+	});
+
+	let command = '( exec ' + shellquote(BIN) + ' check --json' +
+		' --status-file ' + shellquote(statusFile) +
+		' --result-file ' + shellquote(resultFile) +
+		' ) >' + shellquote(LOG_FILE) + ' 2>&1 </dev/null & echo $!';
+
+	clear_file(PID_FILE);
+
+	let p = popen(command);
+	if (p != null) {
+		let pid = int(trim(p.read('all'))) || 0;
+		p.close();
+
+		if (pid > 0)
+			write_text(PID_FILE, '' + pid + '\n');
+	}
+
+	return { started: true, running: false };
+}
+
+const methods = {
+	start: {
+		call: start_check
+	},
+
+	stop: {
+		call: function() {
+			stop_check();
+
+			let cfg = settings();
+			write_json(cfg.status_file || STATUS_FILE, {
+				state: 'idle',
+				phase: '',
+				total: 0,
+				done: 0,
+				message: '',
+				updated: time()
+			});
+
+			return { ok: true, running: false };
+		}
+	},
+
+	restart: {
+		call: function() {
+			/*
+			 * Restart the package runtime and the procd service: make sure
+			 * the package is on, terminate a running check and drop the
+			 * transient state. It deliberately does not start a subscription
+			 * check; that is what the "Проверить подписку" button is for.
+			 */
+			service_action('stop');
+			stop_check();
+
+			let ctx = cursor();
+			ctx.set('subbridge', 'main', 'enabled', '1');
+			ctx.commit('subbridge');
+
+			let cfg = settings();
+			let statusFile = cfg.status_file || STATUS_FILE;
+			let resultFile = cfg.result_file || RESULT_FILE;
+
+			clear_file(resultFile);
+			clear_file(LOG_FILE);
+
+			write_json(statusFile, {
+				state: 'idle',
+				phase: '',
+				total: 0,
+				done: 0,
+				message: '',
+				updated: time()
+			});
+
+			service_action('enable');
+			service_action('start');
+
+			return {
+				ok: true,
+				restarted: true,
+				running: service_running(),
+				enabled: true
+			};
+		}
+	},
+
+	power: {
+		args: {
+			enabled: 'enabled'
+		},
+		call: set_enabled
+	},
+
+	autostart: {
+		args: {
+			enabled: 'enabled'
+		},
+		call: set_enabled
+	},
+
+	status: {
+		call: function() {
+			let cfg = settings();
+			return read_json(cfg.status_file || STATUS_FILE, { state: 'idle' });
+		}
+	},
+
+	result: {
+		call: function() {
+			let cfg = settings();
+			return read_json(cfg.result_file || RESULT_FILE, {});
+		}
+	},
+
+	info: {
+		call: function() {
+			let binary = detect_engine();
+			let cfg = settings();
+
+			return {
+				version: version(),
+				running: service_running(),
+				enabled: cfg.enabled,
+				engine: {
+					path: binary,
+					version: engine_version(binary)
+				},
+				settings: cfg
+			};
+		}
+	},
+
+	save: {
+		args: {
+			subscription: 'subscription',
+			engine: 'engine',
+			test_url: 'test_url',
+			timeout_ms: 'timeout_ms',
+			concurrency: 'concurrency',
+			ua_mode: 'ua_mode',
+			ua_user_agent: 'ua_user_agent',
+			ua_device_os: 'ua_device_os',
+			ua_ver_os: 'ua_ver_os',
+			ua_app_version: 'ua_app_version',
+			ua_device_model: 'ua_device_model',
+			ua_device_locale: 'ua_device_locale',
+			ua_hwid: 'ua_hwid',
+			enabled: 'enabled'
+		},
+		call: function(request) {
+			let ctx = cursor();
+			let args = request.args;
+			let subscription = trim(args.subscription || '');
+
+			if (subscription != '' &&
+			    substr(lc(subscription), 0, 7) != 'http://' &&
+			    substr(lc(subscription), 0, 8) != 'https://')
+				return { error: 'Subscription URL must start with http:// or https://' };
+
+			if (args.subscription != null)
+				ctx.set('subbridge', 'main', 'subscription', subscription);
+
+			if (args.engine != null)
+				ctx.set('subbridge', 'main', 'engine', trim(args.engine));
+
+			if (args.test_url != null)
+				ctx.set('subbridge', 'main', 'test_url', trim(args.test_url));
+
+			if (args.timeout_ms != null) {
+				let timeout = int(args.timeout_ms) || 3000;
+				if (timeout < 500) timeout = 500;
+				if (timeout > 60000) timeout = 60000;
+				ctx.set('subbridge', 'main', 'timeout_ms', '' + timeout);
+			}
+
+			if (args.concurrency != null) {
+				let workers = int(args.concurrency) || 8;
+				if (workers < 1) workers = 1;
+				if (workers > 32) workers = 32;
+				ctx.set('subbridge', 'main', 'concurrency', '' + workers);
+			}
+
+			if (args.ua_mode != null)
+				ctx.set('subbridge', 'main', 'ua_mode',
+					lc(clean_header(args.ua_mode)) == 'custom' ? 'custom' : 'auto');
+
+			for (let field in [
+				'ua_user_agent',
+				'ua_device_os',
+				'ua_ver_os',
+				'ua_app_version',
+				'ua_device_model',
+				'ua_device_locale',
+				'ua_hwid'
+			]) {
+				if (args[field] != null)
+					ctx.set('subbridge', 'main', field, clean_header(args[field]));
+			}
+
+			if (args.enabled != null) {
+				let raw = args.enabled;
+				let on = !(raw === false || raw === 0 || raw == '0' || raw == 'false' || raw == 'off');
+				ctx.set('subbridge', 'main', 'enabled', on ? '1' : '0');
+			}
+
+			ctx.commit('subbridge');
+
+			return { ok: true };
+		}
+	}
+};
+
+return { subbridge: methods };

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Runs after the package is installed. Enables and starts the procd service,
+# then makes rpcd notice the new ubus object and drops the LuCI caches.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+chmod 600 /etc/config/subbridge 2>/dev/null
+
+# opkg writes the new default config to -opkg and apk to .apk-new when the
+# on-disk one differs. The ucode defaults already cover missing options, so
+# neither copy is used.
+rm -f /etc/config/subbridge-opkg 2>/dev/null
+rm -f /etc/config/subbridge.apk-new 2>/dev/null
+
+mkdir -p /etc/subbridge
+chmod 700 /etc/subbridge 2>/dev/null
+
+rm -f /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache/ 2>/dev/null
+
+# The package supplies its own postinst, so run the UCI defaults explicitly:
+# they add options introduced after the first installation (for example the
+# User Agent fields).
+if [ -x /etc/uci-defaults/90_luci-app-subbridge ]; then
+	/etc/uci-defaults/90_luci-app-subbridge
+	rm -f /etc/uci-defaults/90_luci-app-subbridge 2>/dev/null
+fi
+
+if [ "$(uci -q get subbridge.main.enabled)" != "0" ]; then
+	/etc/init.d/subbridge enable 2>/dev/null
+	/etc/init.d/subbridge restart 2>/dev/null
+fi
+
+# Reload is enough: it keeps existing rpcd sessions alive.
+/etc/init.d/rpcd reload 2>/dev/null || /etc/init.d/rpcd restart 2>/dev/null
+
+exit 0

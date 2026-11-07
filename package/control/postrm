@@ -1,0 +1,18 @@
+#!/bin/sh
+# Remove runtime state. /etc/config/subbridge is a conffile and survives a
+# normal removal; /etc/subbridge/hwid is kept on purpose so a reinstall keeps
+# the same device identity with the provider.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+# The service was stopped by prerm, before opkg removed /etc/init.d/subbridge.
+rm -rf /tmp/subbridge 2>/dev/null
+rm -rf /tmp/subbridge-check.lock 2>/dev/null
+# Interrupted checks can leave endpoint configs behind.
+rm -rf /tmp/subbridge-check-* /tmp/subbridge-fetch-* /tmp/subbridge-delay-* /tmp/subbridge-probe-* 2>/dev/null
+
+rm -f /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache/ 2>/dev/null
+
+/etc/init.d/rpcd reload 2>/dev/null
+
+exit 0

@@ -1,0 +1,28 @@
+{
+	"luci-app-subbridge": {
+		"description": "Grant access to the SubBridge subscription checker",
+		"read": {
+			"ubus": {
+				"subbridge": [
+					"info",
+					"status",
+					"result"
+				]
+			},
+			"uci": [ "subbridge" ]
+		},
+		"write": {
+			"ubus": {
+				"subbridge": [
+					"start",
+					"stop",
+					"restart",
+					"power",
+					"autostart",
+					"save"
+				]
+			},
+			"uci": [ "subbridge" ]
+		}
+	}
+}

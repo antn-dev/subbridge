@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs before opkg removes the package files. This is the only point where
+# /etc/init.d/subbridge still exists, so the service must be stopped here:
+# postrm runs after the init script is gone and cannot stop the daemon.
+# default_prerm stops the service and drops the rc.d links; on upgrade it
+# keeps them enabled and postinst restarts the service.
+[ -s "${IPKG_INSTROOT}/lib/functions.sh" ] || exit 0
+
+. "${IPKG_INSTROOT}/lib/functions.sh"
+
+default_prerm "$0" "$@"
+
+exit 0

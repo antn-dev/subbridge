@@ -1,0 +1,33 @@
+config subbridge 'main'
+	option enabled '1'
+	option subscription ''
+
+	# Leave empty to reuse the installed sing-box (podkop-engine, sing-box-forkop
+	# or stock sing-box).
+	option engine ''
+
+	# Empty reuses the built-in default http://cp.cloudflare.com/generate_204.
+	option test_url ''
+	option timeout_ms '3000'
+	option concurrency '8'
+
+	# X-HWID is generated on first use and kept across checks so the provider
+	# does not see a new device on every run.
+	option hwid_file '/etc/subbridge/hwid'
+
+	option status_file '/tmp/subbridge/status.json'
+	option result_file '/tmp/subbridge/result.json'
+
+	# Request identity. "auto" uses Happ on Linux and the other built-in
+	# presets; "custom" sends the values below exactly. Copy them from a
+	# phone to make the provider treat this router as that device.
+	option ua_mode 'auto'
+	option ua_user_agent 'Happ/6.1.0/linux catalyst/2610091518671'
+	option ua_device_os 'Linux'
+	option ua_ver_os '6.6.0'
+	option ua_app_version '6.1.0'
+	option ua_device_model 'Linux PC'
+	option ua_device_locale 'ru'
+
+	# Empty means a persistent random X-HWID in /etc/subbridge/hwid.
+	option ua_hwid ''

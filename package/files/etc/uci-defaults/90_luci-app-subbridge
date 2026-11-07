@@ -1,0 +1,45 @@
+#!/bin/sh
+# Fill in options that were added after the first installation. The UCI
+# defaults in src/config.uc already handle missing values; this script keeps
+# /etc/config/subbridge readable instead of relying on implicit defaults.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+[ -f /etc/config/subbridge ] || exit 0
+
+set_default() {
+	value="$(uci -q get "subbridge.main.$1")"
+
+	if [ -z "$value" ]; then
+		uci -q set "subbridge.main.$1=$2"
+	fi
+}
+
+set_default enabled 1
+set_default engine ''
+# The check URL is shown as a placeholder now: clear the old hard-coded
+# default, but keep a custom value the user may have entered.
+if [ "$(uci -q get subbridge.main.test_url)" = "http://cp.cloudflare.com/generate_204" ]; then
+	uci -q set subbridge.main.test_url=''
+fi
+set_default timeout_ms 3000
+set_default concurrency 8
+set_default hwid_file '/etc/subbridge/hwid'
+set_default status_file '/tmp/subbridge/status.json'
+set_default result_file '/tmp/subbridge/result.json'
+# Periodic checks are gone; drop the option from upgraded configs.
+uci -q delete subbridge.main.interval_min
+set_default ua_mode 'auto'
+set_default ua_user_agent 'Happ/6.1.0/linux catalyst/2610091518671'
+set_default ua_device_os 'Linux'
+set_default ua_ver_os '6.6.0'
+set_default ua_app_version '6.1.0'
+set_default ua_device_model 'Linux PC'
+set_default ua_device_locale 'ru'
+set_default ua_hwid ''
+
+uci -q commit subbridge
+
+mkdir -p /etc/subbridge
+chmod 700 /etc/subbridge 2>/dev/null
+
+exit 0
