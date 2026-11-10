@@ -14,7 +14,7 @@ let output = require("output");
 let daemon = require("daemon");
 
 const VERSION_FILE = "/usr/share/subbridge/version";
-const FALLBACK_VERSION = "0.4.14";
+const FALLBACK_VERSION = "0.5.1";
 
 function version() {
 	if (getenv("SUBBRIDGE_VERSION") != null && getenv("SUBBRIDGE_VERSION") != "")

@@ -13,8 +13,10 @@ const TICK_SECONDS = 60;
 function run() {
 	warn("SubBridge daemon started\n");
 
+	// ucode's sleep() takes milliseconds; passing 60 here would busy-loop at
+	// roughly 16 wakeups per second and waste CPU on the router.
 	while (true)
-		sleep(TICK_SECONDS);
+		sleep(TICK_SECONDS * 1000);
 }
 
 return {

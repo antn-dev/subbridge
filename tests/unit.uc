@@ -14,6 +14,8 @@ let decode = require("decode");
 let parse = require("parse");
 let presets = require("presets");
 let config = require("config");
+let fetch = require("fetch");
+let limits = require("limits");
 
 let failures = 0;
 let checks = 0;
@@ -37,6 +39,19 @@ function contains(name, haystack, needle) {
 	check(name + " (" + needle + " not in " + haystack + ")", index(haystack, needle) >= 0);
 }
 
+function dies(name, fn, needle) {
+	let ok = false;
+
+	try {
+		fn();
+	}
+	catch (e) {
+		ok = needle == null || index("" + e, needle) >= 0;
+	}
+
+	check(name, ok);
+}
+
 // --- util ------------------------------------------------------------------
 
 equal("trim", util.trim("  value \n"), "value");
@@ -49,6 +64,19 @@ equal("to_bool off", util.to_bool("off"), false);
 equal("shell_quote", util.shell_quote("a'b"), "'a'\\''b'");
 equal("split_lines", sprintf("%J", util.split_lines("a\r\nb\n")), "[ \"a\", \"b\", \"\" ]");
 contains("first_line", util.first_line("\n  sing-box version 1.14\n"), "sing-box version 1.14");
+equal("random_hex length", length(util.random_hex(8)), 16);
+check("random_hex differs", util.random_hex(8) != util.random_hex(8));
+contains("temp_path suffix", util.temp_path("/tmp/x"), "/tmp/x.tmp.");
+check("temp_path differs", util.temp_path("/tmp/x") != util.temp_path("/tmp/x"));
+
+let temp = util.temp_dir("subbridge-test");
+let temp_stat = fs.stat(temp);
+check("temp_dir is a directory", temp_stat != null && temp_stat.type == "directory");
+equal("ensure_dir existing", util.ensure_dir(temp, 0700), true);
+let temp_file = temp + "/file";
+util.write_file(temp_file, "x");
+equal("ensure_dir rejects a file", util.ensure_dir(temp_file, 0700), false);
+util.remove_dir(temp);
 
 // --- url -------------------------------------------------------------------
 
@@ -173,6 +201,61 @@ check("valid https", config.valid_subscription("https://example.com/sub") == tru
 check("valid http", config.valid_subscription("http://example.com/sub") == true);
 check("invalid ftp", config.valid_subscription("ftp://example.com/sub") == false);
 check("invalid empty", config.valid_subscription("") == false);
+
+// --- fetch -----------------------------------------------------------------
+
+let identity = {
+	"User-Agent": "Happ/1.0/linux",
+	"X-HWID": "device-id",
+	"X-Device-OS": "Linux"
+};
+let public = fetch.public_headers(identity);
+equal("public headers keep user agent", public["User-Agent"], "Happ/1.0/linux");
+check("public headers drop hwid", public["X-HWID"] == null);
+check("public headers drop device", public["X-Device-OS"] == null);
+
+let trusted = { "sub.example.com": true };
+check("trusted host keeps headers",
+	fetch.trusted_headers(identity, "sub.example.com", trusted)["X-HWID"] == "device-id");
+check("foreign host drops hwid",
+	fetch.trusted_headers(identity, "evil.example.net", trusted)["X-HWID"] == null);
+check("foreign host keeps user agent",
+	fetch.trusted_headers(identity, "evil.example.net", trusted)["User-Agent"] == "Happ/1.0/linux");
+
+// --- limits ----------------------------------------------------------------
+
+check("body limit is set", limits.MAX_BODY_BYTES > 0);
+check("endpoint limit is set", limits.MAX_ENDPOINTS > 0);
+check("profile limit is set", limits.MAX_PROFILES > 0);
+
+let many_lines = "";
+for (let i = 0; i <= limits.MAX_ENDPOINTS; i++)
+	many_lines += "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443#n\n";
+
+dies("too many endpoints rejected", function() {
+	parse.parse(many_lines);
+}, "too many endpoints");
+
+let many_profiles = "[";
+for (let i = 0; i <= limits.MAX_PROFILES; i++)
+	many_profiles += (i > 0 ? "," : "") + "{\"remarks\":\"p\",\"outbounds\":[]}";
+many_profiles += "]";
+
+dies("too many profiles rejected", function() {
+	parse.parse(many_profiles);
+}, "too many profiles");
+
+let big_chunk = "";
+for (let i = 0; i < 1024; i++)
+	big_chunk += "a";
+
+let big_profile = "";
+for (let i = 0; i < 600; i++)
+	big_profile += big_chunk;
+
+dies("oversized profile rejected", function() {
+	parse.parse("[{\"remarks\":\"" + big_profile + "\",\"outbounds\":[]}]");
+}, "profile is too large");
 
 // --- result ----------------------------------------------------------------
 

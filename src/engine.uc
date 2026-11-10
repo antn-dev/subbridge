@@ -13,6 +13,7 @@ let socket = require("socket");
 let util = require("util");
 let url = require("url");
 let fetch = require("fetch");
+let limits = require("limits");
 
 const START_TIMEOUT_MS = 8000;
 const STOP_TIMEOUT_MS = 3000;
@@ -485,6 +486,13 @@ function start(binary, support, endpoints) {
 
 		let original = kept[rejected];
 		dropped[original] = "engine rejected the endpoint: " + first_error_line(checked.output);
+
+		// Rebuilding the whole configuration for every rejected endpoint is
+		// expensive; a broken subscription must not turn into an O(N^2) loop.
+		if (length(keys(dropped)) > limits.MAX_REJECTED_ENDPOINTS) {
+			util.command("rm -rf " + util.shell_quote(dir));
+			die("engine rejected too many endpoints (limit " + limits.MAX_REJECTED_ENDPOINTS + ")");
+		}
 
 		// Remove the rejected entry; the next config uses the remaining ones.
 		let next = [];

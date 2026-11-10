@@ -13,9 +13,12 @@ let util = require("util");
 let url = require("url");
 let presets = require("presets");
 let hwid = require("hwid");
+let limits = require("limits");
+let fs = require("fs");
 
 const MAX_HANDOFF_DEPTH = 5;
 const MAX_REDIRECTS = 5;
+const MAX_BODY_BYTES = limits.MAX_BODY_BYTES;
 
 let transport_cache = null;
 
@@ -214,6 +217,34 @@ function prepare_headers(headers, hwid_path) {
 	return out;
 }
 
+// A redirect or handoff link can point at a different host. Identity headers
+// (X-HWID and any custom X-*) belong to the subscription origin only; sending
+// them to an arbitrary host would leak the device identity. A plain
+// User-Agent is enough for CDN-like hops.
+function public_headers(headers) {
+	let out = {};
+
+	for (let key in keys(headers)) {
+		if (lc(key) == "user-agent")
+			out[key] = headers[key];
+	}
+
+	return out;
+}
+
+function trusted_headers(headers, host, trusted) {
+	if (trusted == null || trusted[lc(host)] == true)
+		return headers;
+
+	return public_headers(headers);
+}
+
+function check_body_size(path) {
+	let st = fs.stat(path);
+	if (st != null && st.type == "file" && st.size > MAX_BODY_BYTES)
+		die("subscription is too large (limit " + MAX_BODY_BYTES + " bytes)");
+}
+
 function resolve_url(raw) {
 	let parsed = url.parse(raw);
 
@@ -273,6 +304,7 @@ function http_once(target, headers, timeout, workdir) {
 			"-sS",
 			"--http1.1",
 			"--max-time", "" + timeout,
+			"--max-filesize", "" + MAX_BODY_BYTES,
 			"-D", header_path,
 			"-o", body_path,
 			"-w", "%{http_code}"
@@ -289,6 +321,8 @@ function http_once(target, headers, timeout, workdir) {
 		if (result.code != 0) {
 			die("download failed: " + (util.first_line(result.output) == "" ? "curl exited with " + result.code : util.first_line(result.output)));
 		}
+
+		check_body_size(body_path);
 
 		let header_text = read_text(header_path);
 		let lines = util.split_lines(header_text);
@@ -321,6 +355,8 @@ function http_once(target, headers, timeout, workdir) {
 		die("download failed: " + (message == "" ? "uclient-fetch exited with " + result.code : message));
 	}
 
+	check_body_size(body_path);
+
 	return {
 		status: 200,
 		body: read_text(body_path),
@@ -329,11 +365,12 @@ function http_once(target, headers, timeout, workdir) {
 	};
 }
 
-function fetch_follow(raw, headers, timeout, workdir) {
+function fetch_follow(raw, headers, timeout, workdir, trusted) {
 	let current = unwrap_app_link(raw);
 
 	for (let depth = 0; depth <= MAX_REDIRECTS; depth++) {
-		let response = http_once(current, headers, timeout, workdir);
+		let host = lc(url.parse(current).host);
+		let response = http_once(current, trusted_headers(headers, host, trusted), timeout, workdir);
 
 		if (response.status >= 300 && response.status < 400) {
 			if (response.location == "")
@@ -653,27 +690,36 @@ function fetch_subscription(raw_url, headers, hwid_path, timeout, workdir) {
 	let resolved = resolve_url(raw_url);
 	let prepared = prepare_headers(headers, hwid_path);
 	let target = presets.parse_target(url.parse(raw_url).fragment);
+	let trusted = {};
+
+	// Only the subscription origin (and the host named by the provider in
+	// ?domen=) may receive X-HWID and custom identity headers.
+	trusted[lc(url.parse(unwrap_app_link(resolved)).host)] = true;
 
 	// A handoff link often carries the real subscription host in ?domen=... and
 	// the id in ?subscription=.... The direct address is cleaner than the
 	// per-app page, so try it first.
 	let direct = extract_domain_subscription(url.parse(resolved));
-	if (direct != "" && direct != resolved) {
-		try {
-			let attempt = fetch_follow(direct, prepared, timeout, workdir);
-			if (!looks_like_html(attempt.body)) {
-				return { data: attempt.body, url: attempt.url, headers: prepared };
+	if (direct != "") {
+		trusted[lc(url.parse(unwrap_app_link(direct)).host)] = true;
+
+		if (direct != resolved) {
+			try {
+				let attempt = fetch_follow(direct, prepared, timeout, workdir, trusted);
+				if (!looks_like_html(attempt.body)) {
+					return { data: attempt.body, url: attempt.url, headers: prepared };
+				}
 			}
-		}
-		catch (e) {
-			// Fall through to the normal handoff flow.
+			catch (e) {
+				// Fall through to the normal handoff flow.
+			}
 		}
 	}
 
 	let current = resolved;
 
 	for (let depth = 0; depth < MAX_HANDOFF_DEPTH; depth++) {
-		let response = fetch_follow(current, prepared, timeout, workdir);
+		let response = fetch_follow(current, prepared, timeout, workdir, trusted);
 
 		if (!looks_like_html(response.body))
 			return { data: response.body, url: response.url, headers: prepared };
@@ -697,6 +743,8 @@ return {
 	looks_like_html,
 	header_lines,
 	prepare_headers,
+	public_headers,
+	trusted_headers,
 	resolve_url,
 	fetch_follow,
 	is_blocked_host,

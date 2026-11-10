@@ -13,6 +13,7 @@ const DEFAULTS = {
 	hwid_file: "/etc/subbridge/hwid",
 	status_file: "/tmp/subbridge/status.json",
 	result_file: "/tmp/subbridge/result.json",
+	pid_file: "/tmp/subbridge/check.pid",
 	ua_mode: "auto",
 	ua_user_agent: "Happ/6.1.0/linux catalyst/2610091518671",
 	ua_device_os: "Linux",
@@ -33,6 +34,7 @@ const USAGE = "Usage: subbridge [check|daemon|status|info|version|help] [options
 	"  --hwid-file PATH     persistent X-HWID location\n" +
 	"  --status-file PATH   progress document for LuCI\n" +
 	"  --result-file PATH   write the JSON result to this file\n" +
+	"  --pid-file PATH      write the check process id here\n" +
 	"  --json               print the result as JSON\n" +
 	"  --compact            keep JSON on one line (for scripts)\n" +
 	"  --verbose            print progress in JSON mode too\n" +
@@ -156,6 +158,9 @@ function parse_args(argv) {
 		case "result-file":
 			args.overrides.result_file = value;
 			break;
+		case "pid-file":
+			args.overrides.pid_file = value;
+			break;
 		case "help":
 			args.command = "help";
 			break;
@@ -180,6 +185,7 @@ function load(args) {
 	cfg.hwid_file = stored.hwid_file == "" ? DEFAULTS.hwid_file : stored.hwid_file;
 	cfg.status_file = stored.status_file == "" ? DEFAULTS.status_file : stored.status_file;
 	cfg.result_file = stored.result_file == "" ? DEFAULTS.result_file : stored.result_file;
+	cfg.pid_file = DEFAULTS.pid_file;
 
 	cfg.ua_mode = stored.ua_mode == "custom" ? "custom" : "auto";
 	cfg.ua_user_agent = stored.ua_user_agent == "" ? DEFAULTS.ua_user_agent : stored.ua_user_agent;

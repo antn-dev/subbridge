@@ -22,9 +22,15 @@ start_service() {
 }
 
 stop_service() {
-	# A check runs inside the daemon process; when procd terminates it the
-	# temporary engine may survive for a moment. Remove it and the lock so the
-	# next start is clean.
+	# A check is a separate rpcd-started process, not a child of this daemon.
+	# The shared script verifies its PID and terminates it before the package
+	# files or temporary state can disappear.
+	if [ -x /usr/lib/subbridge/stop.sh ]; then
+		/usr/lib/subbridge/stop.sh
+		return 0
+	fi
+
+	# Fallback for an installation that still has the old file layout.
 	pgrep -f '[s]ing-box run -c /tmp/subbridge-check-' 2>/dev/null |
 		while read -r pid; do kill -TERM "$pid" 2>/dev/null; done
 	pgrep -f '[s]ing-box check -c /tmp/subbridge-probe-' 2>/dev/null |

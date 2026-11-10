@@ -34,7 +34,7 @@ function flush(w) {
 	if (dir != "" && dir != ".")
 		util.ensure_dir(dir, 0700);
 
-	let tmp = w.path + ".tmp." + int(clock()[1] % 1000000);
+	let tmp = util.temp_path(w.path);
 	if (!util.json_write(tmp, w.rep)) {
 		return;
 	}

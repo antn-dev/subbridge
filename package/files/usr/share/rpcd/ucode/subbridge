@@ -13,7 +13,7 @@
 // Long work happens in /usr/bin/subbridge, which owns the check lock and the
 // status/result files, so these calls return immediately and never block LuCI.
 
-import { popen, stat, mkdir, unlink, readfile, open, dirname } from 'fs';
+import { popen, stat, lstat, mkdir, unlink, readfile, open, dirname } from 'fs';
 import { cursor } from 'uci';
 
 const STATE_DIR = '/tmp/subbridge';
@@ -22,6 +22,7 @@ const RESULT_FILE = STATE_DIR + '/result.json';
 const LOG_FILE = STATE_DIR + '/check.log';
 const PID_FILE = STATE_DIR + '/check.pid';
 const LOCK_DIR = '/tmp/subbridge-check.lock';
+const STOP_SCRIPT = '/usr/lib/subbridge/stop.sh';
 const BIN = '/usr/bin/subbridge';
 const INIT_SCRIPT = '/etc/init.d/subbridge';
 
@@ -47,8 +48,15 @@ function clean_header(value) {
 }
 
 function ensure_dir(path) {
-	if (stat(path) == null)
-		mkdir(path, 0700);
+	let st = lstat(path);
+
+	if (st != null)
+		return st.type == 'directory';
+
+	mkdir(path, 0700);
+	st = lstat(path);
+
+	return st != null && st.type == 'directory';
 }
 
 function read_json(path, fallback) {
@@ -68,8 +76,8 @@ function read_json(path, fallback) {
 function write_json(path, value) {
 	let dir = dirname(path);
 
-	if (dir != null && dir != '' && dir != '.' && stat(dir) == null)
-		mkdir(dir, 0700);
+	if (dir != null && dir != '' && dir != '.' && !ensure_dir(dir))
+		return;
 
 	let f = open(path, 'w', 0600);
 	if (f != null) {
@@ -120,7 +128,7 @@ function detect_engine() {
 
 function version() {
 	let value = trim(readfile('/usr/share/subbridge/version'));
-	return value == '' ? '0.4.14' : value;
+	return value == '' ? '0.5.1' : value;
 }
 
 function engine_version(binary) {
@@ -157,74 +165,46 @@ function write_text(path, text) {
 	}
 }
 
-function process_alive(pid) {
-	return pid > 0 && stat('/proc/' + pid) != null;
-}
+function check_running() {
+	if (stat('/proc') == null)
+		return stat(LOCK_DIR) != null;
 
-function read_pid() {
-	return int(trim(readfile(PID_FILE))) || 0;
-}
+	let p = popen("pgrep -f '[s]ubbridge/main.uc check' 2>/dev/null");
 
-function signal_pid(pid, signal) {
-	if (pid <= 0)
-		return;
+	if (p == null)
+		return false;
 
-	let p = popen('kill -' + signal + ' ' + pid + ' 2>/dev/null');
+	let output = p.read('all');
+	p.close();
 
-	if (p != null)
-		p.close();
+	return trim(output) != '';
 }
 
 /*
- * Stop every sing-box process that belongs to SubBridge. The check normally
- * closes its engine through a finally/catch path, but a TERM at the wrong
- * moment can leave the temporary engine behind. The bracket in the pattern
- * keeps pgrep from matching its own command line.
+ * Termination lives in one shared script so the procd init script, package
+ * removal and LuCI all behave the same way. The script verifies
+ * /proc/PID/cmdline before sending a signal.
  */
-function kill_engine_processes() {
-	for (let pattern in [
-		'[s]ing-box run -c /tmp/subbridge-check-',
-		'[s]ing-box check -c /tmp/subbridge-probe-'
-	]) {
-		let p = popen('pgrep -f ' + shellquote(pattern) + ' 2>/dev/null');
-
-		if (p == null)
-			continue;
-
-		let output = p.read('all');
-		p.close();
-
-		for (let line in split(output, '\n')) {
-			let pid = int(trim(line));
-
-			if (pid > 0)
-				signal_pid(pid, 'TERM');
-		}
-	}
-}
-
 function stop_check() {
-	let pid = read_pid();
+	if (stat(STOP_SCRIPT) == null) {
+		// Transitional fallback for an older installation: never signal a
+		// PID without being able to verify what it is.
+		clear_file(PID_FILE);
 
-	if (process_alive(pid)) {
-		signal_pid(pid, 'TERM');
+		if (stat(LOCK_DIR) != null) {
+			let p = popen('rmdir ' + shellquote(LOCK_DIR) + ' 2>/dev/null');
 
-		for (let i = 0; i < 30 && process_alive(pid); i++)
-			sleep(0.1);
+			if (p != null)
+				p.close();
+		}
 
-		if (process_alive(pid))
-			signal_pid(pid, 'KILL');
+		return;
 	}
 
-	kill_engine_processes();
-	clear_file(PID_FILE);
+	let p = popen(shellquote(STOP_SCRIPT) + ' 2>/dev/null');
 
-	if (stat(LOCK_DIR) != null) {
-		let p = popen('rmdir ' + shellquote(LOCK_DIR) + ' 2>/dev/null');
-
-		if (p != null)
-			p.close();
-	}
+	if (p != null)
+		p.close();
 }
 
 function run_command(command) {
@@ -299,10 +279,17 @@ function start_check() {
 	if (!cfg.enabled)
 		return { started: false, running: false, error: 'SubBridge is disabled' };
 
-	ensure_dir(STATE_DIR);
+	if (!ensure_dir(STATE_DIR))
+		return { started: false, running: false, error: 'unsafe state directory' };
 
-	if (stat(LOCK_DIR) != null)
-		return { started: false, running: true };
+	if (stat(LOCK_DIR) != null) {
+		if (check_running())
+			return { started: false, running: true };
+
+		// A crashed check can leave its lock behind. Remove it only after
+		// confirming that no verified check process is alive.
+		stop_check();
+	}
 
 	clear_file(resultFile);
 
@@ -318,6 +305,7 @@ function start_check() {
 	let command = '( exec ' + shellquote(BIN) + ' check --json' +
 		' --status-file ' + shellquote(statusFile) +
 		' --result-file ' + shellquote(resultFile) +
+		' --pid-file ' + shellquote(PID_FILE) +
 		' ) >' + shellquote(LOG_FILE) + ' 2>&1 </dev/null & echo $!';
 
 	clear_file(PID_FILE);

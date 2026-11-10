@@ -42,6 +42,7 @@ install_file() {
 }
 
 install_file "$ROOT/package/files/usr/bin/subbridge" /usr/bin/subbridge 0755
+install_file "$ROOT/package/files/usr/lib/subbridge/stop.sh" /usr/lib/subbridge/stop.sh 0755
 install_file "$ROOT/package/files/usr/share/rpcd/ucode/subbridge" /usr/share/rpcd/ucode/subbridge 0644
 install_file "$ROOT/package/files/usr/share/rpcd/acl.d/luci-app-subbridge.json" /usr/share/rpcd/acl.d/luci-app-subbridge.json 0644
 install_file "$ROOT/package/files/usr/share/luci/menu.d/luci-app-subbridge.json" /usr/share/luci/menu.d/luci-app-subbridge.json 0644

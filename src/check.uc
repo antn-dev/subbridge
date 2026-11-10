@@ -17,25 +17,78 @@ let output = require("output");
 let config = require("config");
 
 const LOCK_DIR = "/tmp/subbridge-check.lock";
-const STALE_LOCK_SECONDS = 900;
+const LOCK_PID = LOCK_DIR + "/pid";
+const LOCK_START_GRACE = 10;
+
+function process_is_check(pid) {
+	if (pid <= 0 || fs.stat("/proc/" + pid) == null)
+		return false;
+
+	// /proc/PID/cmdline is NUL-separated, and ucode's read_file() stops at
+	// the first NUL. tr is the portable way to turn it into text.
+	let result = util.command("tr '\\000' ' ' < /proc/" + pid + "/cmdline 2>/dev/null");
+
+	if (result.code != 0 || result.output == null || result.output == "")
+		return false;
+
+	return index(result.output, "/usr/lib/subbridge/main.uc") >= 0 &&
+		match(result.output, /(^|\s)check(\s|$)/) != null;
+}
+
+function lock_owner() {
+	let pid = util.to_int(util.trim(util.read_file(LOCK_PID)), 0);
+	return process_is_check(pid) ? pid : 0;
+}
+
+function clear_lock() {
+	fs.unlink(LOCK_PID);
+	fs.rmdir(LOCK_DIR);
+}
 
 function acquire_lock() {
-	let st = fs.stat(LOCK_DIR);
+	let st = fs.lstat(LOCK_DIR);
+
 	if (st != null) {
-		if (time() - st.mtime > STALE_LOCK_SECONDS) {
-			fs.rmdir(LOCK_DIR);
-		}
-		else {
+		// The lock is held only while its PID is alive and is really a
+		// SubBridge check. Age alone must never let a second check in.
+		if (lock_owner() > 0)
 			die("A check is already running");
+
+		let pid = util.to_int(util.trim(util.read_file(LOCK_PID)), 0);
+
+		if (st.type != "directory") {
+			fs.unlink(LOCK_DIR);
+			st = null;
 		}
+		else if (pid <= 0 && time() - st.mtime < LOCK_START_GRACE) {
+			// mkdir happened but the owner has not published its PID yet.
+			die("A check is already starting");
+		}
+
+		if (st != null)
+			clear_lock();
 	}
 
 	if (fs.mkdir(LOCK_DIR, 0700) != true)
 		die("Cannot create the check lock");
+
+	if (!util.write_file(LOCK_PID, "" + util.process_id() + "\n", 0600)) {
+		fs.rmdir(LOCK_DIR);
+		die("Cannot write the check lock");
+	}
 }
 
 function release_lock() {
-	fs.rmdir(LOCK_DIR);
+	if (lock_owner() == util.process_id())
+		clear_lock();
+}
+
+function clear_pidfile(path, pid) {
+	if (path == null || path == "")
+		return;
+
+	if (util.to_int(util.trim(util.read_file(path)), 0) == pid)
+		fs.unlink(path);
 }
 
 function cleanup_dir(path) {
@@ -65,6 +118,10 @@ function load_subscription(cfg, workdir) {
 
 		try {
 			let response = fetch.fetch_subscription(cfg.subscription, preset.headers, cfg.hwid_file, 30, workdir);
+
+			// Keep only the size: the full payload is needed for parsing but
+			// must not stay in RAM for the whole check.
+			let size = length(response.data);
 			let parsed = parse.parse(decode.decode(response.data));
 
 			if (length(parsed.endpoints) == 0) {
@@ -73,7 +130,7 @@ function load_subscription(cfg, workdir) {
 			}
 
 			return {
-				data: response.data,
+				size: size,
 				url: response.url,
 				headers: response.headers,
 				preset: preset,
@@ -119,10 +176,15 @@ function run(cfg) {
 	let process = null;
 	let fetchdir = null;
 	let delaydir = null;
+	let pidfile = cfg.pid_file == null ? "" : cfg.pid_file;
+	let pid = util.process_id();
 
 	try {
 		acquire_lock();
 		locked = true;
+
+		if (pidfile != "")
+			util.write_file(pidfile, "" + pid + "\n", 0600);
 
 		sweep_stale();
 
@@ -156,7 +218,7 @@ function run(cfg) {
 		status.phase(st, "parse");
 
 		if (!cfg.json || cfg.verbose) {
-			printf("Downloaded %d bytes\n", length(loaded.data));
+			printf("Downloaded %d bytes\n", loaded.size);
 			printf("Found %d profiles\n", length(loaded.profiles));
 			printf("Found %d endpoints\n", length(loaded.endpoints));
 			printf("Resolved: %s\n", loaded.url);
@@ -294,6 +356,7 @@ function run(cfg) {
 			process = null;
 		}
 
+		clear_pidfile(pidfile, pid);
 		release_lock();
 		locked = false;
 
@@ -334,6 +397,8 @@ function run(cfg) {
 		cleanup_dir(delaydir);
 		cleanup_dir(fetchdir);
 
+		clear_pidfile(pidfile, pid);
+
 		if (locked)
 			release_lock();
 
@@ -344,6 +409,8 @@ function run(cfg) {
 
 return {
 	LOCK_DIR,
+	LOCK_PID,
+	process_is_check,
 	acquire_lock,
 	release_lock,
 	load_subscription,

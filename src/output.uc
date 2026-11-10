@@ -91,7 +91,7 @@ function write_json(value, path, compact) {
 		if (dir != "" && dir != ".")
 			util.ensure_dir(dir, 0700);
 
-		let tmp = path + ".tmp." + int(clock()[1] % 1000000);
+		let tmp = util.temp_path(path);
 		if (!util.write_file(tmp, text, 0600))
 			die("cannot write result file " + path);
 

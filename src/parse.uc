@@ -11,6 +11,7 @@
 
 let util = require("util");
 let url = require("url");
+let limits = require("limits");
 
 function get(obj, key) {
 	if (obj == null)
@@ -411,6 +412,9 @@ function parse(decoded) {
 		if (type(items) != "array")
 			die("parse subscription: expected an array of profiles");
 
+		if (length(items) > limits.MAX_PROFILES)
+			die("subscription contains too many profiles (limit " + limits.MAX_PROFILES + ")");
+
 		let index = 0;
 
 		for (let profile in items) {
@@ -419,9 +423,16 @@ function parse(decoded) {
 			for (let endpoint in profile_endpoints)
 				push(endpoints, endpoint);
 
+			if (length(endpoints) > limits.MAX_ENDPOINTS)
+				die("subscription contains too many endpoints (limit " + limits.MAX_ENDPOINTS + ")");
+
+			let payload = sprintf("%J", profile);
+			if (length(payload) > limits.MAX_PROFILE_BYTES)
+				die("profile is too large (limit " + limits.MAX_PROFILE_BYTES + " bytes)");
+
 			push(profiles, {
 				name: profile_name(str(get(profile, "remarks")), index),
-				payload: sprintf("%J", profile)
+				payload: payload
 			});
 
 			index++;
@@ -447,6 +458,9 @@ function parse(decoded) {
 			catch (e) {
 				// One malformed line must not discard the subscription.
 			}
+
+			if (length(endpoints) > limits.MAX_ENDPOINTS)
+				die("subscription contains too many endpoints (limit " + limits.MAX_ENDPOINTS + ")");
 		}
 
 		if (length(endpoints) == 0)

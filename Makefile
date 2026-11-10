@@ -99,6 +99,8 @@ define Package/subbridge/install
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/*.uc $(1)/usr/lib/subbridge/
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(CURDIR)/package/files/usr/bin/subbridge $(1)/usr/bin/subbridge
+	$(INSTALL_DIR) $(1)/usr/lib/subbridge
+	$(INSTALL_BIN) $(CURDIR)/package/files/usr/lib/subbridge/stop.sh $(1)/usr/lib/subbridge/stop.sh
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/ucode
 	$(INSTALL_DATA) $(CURDIR)/package/files/usr/share/rpcd/ucode/subbridge $(1)/usr/share/rpcd/ucode/subbridge
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d

@@ -55,22 +55,68 @@ function dirname(path) {
 	return substr(s, 0, slash);
 }
 
+function current_uid() {
+	let data = read_file("/proc/self/status");
+	if (data == null)
+		return -1;
+
+	let m = match(data, /\nUid:[ \t]+([0-9]+)/);
+	return m == null ? -1 : int(m[1]);
+}
+
+function process_id() {
+	let data = read_file("/proc/self/stat");
+	if (data == null)
+		return 0;
+
+	let m = match(data, /^([0-9]+)/);
+	return m == null ? 0 : int(m[1]);
+}
+
+function private_dir(st) {
+	if (st == null || st.type != "directory" || st.perm == null)
+		return false;
+
+	return st.perm.group_write != true && st.perm.other_write != true;
+}
+
 function ensure_dir(path, mode) {
 	path = trim(path);
 	if (path == "" || path == "/")
 		return true;
 
+	let wanted = mode == null ? 0700 : mode;
 	let current = "";
+
 	for (let part in split(path, "/")) {
 		if (part == "")
 			continue;
 
 		current += "/" + part;
-		if (fs.stat(current) == null)
-			fs.mkdir(current, mode == null ? 0700 : mode);
+		let st = fs.lstat(current);
+
+		if (st == null) {
+			fs.mkdir(current, wanted);
+			st = fs.lstat(current);
+		}
+
+		// A symlink or a file must never be accepted where a directory is
+		// expected: writes would follow it outside our temporary tree.
+		if (st == null || st.type != "directory")
+			return false;
 	}
 
-	return fs.stat(path) != null;
+	let st = fs.lstat(path);
+	if (!private_dir(st))
+		return false;
+
+	// A directory created in advance by another local user could be used to
+	// read the endpoint credentials written into it.
+	let uid = current_uid();
+	if (uid >= 0 && type(st.uid) == "int" && st.uid != uid)
+		return false;
+
+	return true;
 }
 
 function file_exists(path) {
@@ -222,7 +268,7 @@ function remove_dir(path) {
 		return;
 
 	if (st.type == "directory") {
-		for (let name in fs.readdir(path))
+		for (let name in fs.lsdir(path))
 			remove_dir(path + "/" + name);
 
 		fs.rmdir(path);
@@ -232,11 +278,38 @@ function remove_dir(path) {
 	}
 }
 
-function temp_dir(prefix) {
-	let base = "/tmp/" + prefix + "-" + time() + "-" + int(clock()[1] % 1000000) + "-" + ord(substr(random_bytes(1), 0, 1));
-	ensure_dir(base, 0700);
+function random_hex(count) {
+	let out = "";
+	let bytes = random_bytes(count);
 
-	return base;
+	for (let i = 0; i < length(bytes); i++)
+		out += sprintf("%02x", ord(substr(bytes, i, 1)));
+
+	return out;
+}
+
+function temp_path(path) {
+	return "" + path + ".tmp." + random_hex(8);
+}
+
+function temp_dir(prefix) {
+	// mkdir is atomic and fails on an existing path, including a symlink
+	// planted in /tmp. 64 bits of randomness make guessing impractical.
+	for (let attempt = 0; attempt < 8; attempt++) {
+		let base = "/tmp/" + prefix + "-" + random_hex(8);
+
+		if (fs.mkdir(base, 0700) != true)
+			continue;
+
+		let st = fs.lstat(base);
+		if (private_dir(st) &&
+		    (type(st.uid) != "int" || st.uid == current_uid()))
+			return base;
+
+		fs.rmdir(base);
+	}
+
+	die("cannot create a temporary directory");
 }
 
 return {
@@ -261,6 +334,10 @@ return {
 	lower,
 	now_ms,
 	random_bytes,
+	random_hex,
+	temp_path,
+	current_uid,
+	process_id,
 	find_in_path,
 	remove_dir,
 	temp_dir
