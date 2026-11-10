@@ -31,11 +31,19 @@
 ### Одной командой
 
 ```sh
-wget -qO- https://github.com/antn-dev/subbridge/releases/latest/download/install.sh | sh
+wget -qO- https://antn-dev.github.io/subbridge/install.sh | sh
 ```
 
 Скрипт запускается от `root`, сам определяет `apk` или `opkg`, скачивает
 подходящий пакет из последнего релиза, проверяет SHA-256 и устанавливает его.
+
+Если `github.io` недоступен, используйте зеркало jsDelivr:
+
+```sh
+wget -qO- https://cdn.jsdelivr.net/gh/antn-dev/subbridge@gh-pages/install.sh | sh
+```
+
+Установщик сам перебирает несколько зеркал и пропускает недоступные хосты.
 Эту же команду можно использовать для обновления.
 
 После установки откройте **Services → SubBridge**, вставьте ссылку на
