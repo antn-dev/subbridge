@@ -91,7 +91,10 @@ jobs:
           test -f "$ipk"
 
           work=$(mktemp -d)
-          tar xzf "$ipk" -C "$work" data.tar.gz control.tar.gz
+          # The member names carry a leading "./"; GNU tar matches them
+          # literally, while bsdtar is lenient. Spelling them out keeps this
+          # step working on both.
+          tar xzf "$ipk" -C "$work" ./data.tar.gz ./control.tar.gz
           tar tzf "$work/data.tar.gz" | grep -q 'usr/lib/subbridge/net.uc'
           tar tzf "$work/data.tar.gz" | grep -q 'usr/share/subbridge/version'
           tar xzf "$work/data.tar.gz" -C "$work" ./usr/share/subbridge/version
