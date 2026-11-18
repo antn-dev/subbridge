@@ -126,7 +126,7 @@ else
 
 VERSION := $(shell cat VERSION)
 
-.PHONY: all package apk dist clean test check
+.PHONY: all package apk dist release sign clean test check
 
 all: package
 
@@ -135,6 +135,14 @@ package:
 
 apk:
 	./scripts/build-apk.sh
+
+# Sign dist/SHA256SUMS so the installer can verify it. Needs the secret key in
+# ~/.subbridge-signing and usign (see scripts/sign.sh).
+sign:
+	./scripts/sign.sh
+
+release:
+	./scripts/release.sh
 
 dist: package
 

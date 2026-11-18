@@ -97,5 +97,69 @@ kill "$victim" 2>/dev/null || true
 wait "$victim" 2>/dev/null || true
 ok "unrelated lock PID ignored"
 
+# --- a second check must not overwrite the running check's status ----------
+
+# The status writer used to be created before the lock was taken, so a second
+# invocation replaced the running check's progress with an error and LuCI
+# showed a failure while the first check was still working.
+
+cat >"$LIB/main.uc" <<'EOF'
+#!/usr/bin/ucode
+sleep(60000);
+EOF
+
+ucode -L "$LIB" "$LIB/main.uc" check &
+checkpid=$!
+sleep 1
+
+mkdir -p /tmp/subbridge-check.lock
+printf '%s\n' "$checkpid" > /tmp/subbridge-check.lock/pid
+
+mkdir -p /tmp/subbridge
+before='{"state":"checking","phase":"probe","total":5,"done":3,"message":"","updated":1}'
+printf '%s\n' "$before" > /tmp/subbridge/status.json
+
+cat >"$STUB/second.uc" <<'EOF'
+let util = require("util");
+let check = require("check");
+
+let path = "/tmp/subbridge/status.json";
+let error = "";
+
+try {
+	check.run({
+		enabled: true,
+		subscription: "http://1.1.1.1/sub",
+		status_file: path,
+		result_file: "/tmp/subbridge/result.json",
+		pid_file: "/tmp/subbridge/check.pid",
+		timeout: 1000,
+		concurrency: 1,
+		verbose: false,
+		json: true
+	});
+}
+catch (e) {
+	error = "" + e;
+}
+
+printf("%s\t%s", error, util.read_file(path));
+EOF
+
+out=$(ucode $MODULES "$STUB/second.uc" 2>&1)
+error=${out%%	*}
+after=${out#*	}
+
+case "$error" in
+*"already running"*) ;;
+*) fail "second check did not report the lock: $error" ;;
+esac
+
+[ "$after" = "$before" ] || fail "second check overwrote status.json: $after"
+ok "second check leaves status.json alone"
+
+kill "$checkpid" 2>/dev/null || true
+wait "$checkpid" 2>/dev/null || true
+
 rm -rf /tmp/subbridge /tmp/subbridge-check.lock "$STUB"
 ok "all stop/lock tests passed"

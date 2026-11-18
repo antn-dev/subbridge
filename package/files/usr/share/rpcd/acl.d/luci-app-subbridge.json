@@ -17,9 +17,7 @@
 					"start",
 					"stop",
 					"restart",
-					"power",
-					"autostart",
-					"save"
+					"power"
 				]
 			},
 			"uci": [ "subbridge" ]

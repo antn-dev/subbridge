@@ -170,7 +170,11 @@ function best_result(results) {
 }
 
 function run(cfg) {
-	let st = status.writer(cfg.status_file);
+	// The status writer is created only after the lock is taken. A second
+	// invocation would otherwise overwrite the running check's progress
+	// document with "A check is already running", and LuCI would show an
+	// error while the first check is still working.
+	let st = null;
 	let started = util.now_ms();
 	let locked = false;
 	let process = null;
@@ -182,6 +186,8 @@ function run(cfg) {
 	try {
 		acquire_lock();
 		locked = true;
+
+		st = status.writer(cfg.status_file);
 
 		if (pidfile != "")
 			util.write_file(pidfile, "" + pid + "\n", 0600);

@@ -14,11 +14,16 @@ let url = require("url");
 let presets = require("presets");
 let hwid = require("hwid");
 let limits = require("limits");
+let net = require("net");
 let fs = require("fs");
 
 const MAX_HANDOFF_DEPTH = 5;
 const MAX_REDIRECTS = 5;
 const MAX_BODY_BYTES = limits.MAX_BODY_BYTES;
+
+// A handoff page is small. Scoring every link on a huge page buys nothing and
+// costs memory, so only the first few hundred candidates are kept.
+const MAX_HANDOFF_CANDIDATES = 200;
 
 let transport_cache = null;
 
@@ -283,26 +288,71 @@ function first_header(headers, name) {
 }
 
 function read_text(path) {
+	// A failed ulimit check can leave a short file behind; read_text must never
+	// pull an unbounded body into RAM.
+	let st = fs.stat(path);
+	if (st == null || st.type != "file")
+		return "";
+
+	if (st.size > MAX_BODY_BYTES)
+		die("subscription is too large (limit " + MAX_BODY_BYTES + " bytes)");
+
 	let value = util.read_file(path);
 	return value == null ? "" : value;
 }
 
+// A provider-controlled URL may point at the router itself or at a LAN host.
+// Scheme and destination are validated before any client runs, and the body is
+// written under a kernel-enforced size limit (see util.command_to_file).
+function assert_target_allowed(target) {
+	let parsed = url.parse(target);
+
+	if (!net.scheme_allowed(parsed.scheme))
+		die("refusing to download over " + (parsed.scheme == "" ? "an unknown scheme" : parsed.scheme + "://"));
+
+	if (net.host_blocked(parsed.host))
+		die("refusing to download from a non-public address: " + parsed.host);
+
+	if (net.resolve_blocked(parsed.host))
+		die("refusing to download from a non-public address: " + parsed.host);
+}
+
+// The fetch layer works in SECONDS because that is what both clients take:
+// curl --max-time N and uclient-fetch --timeout=N. (The engine's delay budget
+// is in milliseconds and is converted at the call site.)
 function http_once(target, headers, timeout, workdir) {
 	let binary = transport();
 	if (binary == null)
 		die("neither curl nor uclient-fetch is installed");
 
+	assert_target_allowed(target);
+
+	// Callers pass 30 by default; clamp so a provider cannot be given an
+	// unbounded per-request budget through configuration.
+	timeout = util.to_int(timeout, limits.MAX_FETCH_SECONDS);
+	if (timeout < 1)
+		timeout = 1;
+	if (timeout > limits.MAX_FETCH_SECONDS)
+		timeout = limits.MAX_FETCH_SECONDS;
+
 	let body_path = workdir + "/body";
 	let header_path = workdir + "/headers";
+	let code_path = workdir + "/code";
 
 	// Remove leftovers: a failed request must not return the previous body.
-	util.command("rm -f " + util.shell_quote(body_path) + " " + util.shell_quote(header_path));
+	// These are plain files, so unlink is enough and removes nothing else.
+	for (let path in [ body_path, header_path, code_path ]) {
+		if (fs.stat(path) != null)
+			fs.unlink(path);
+	}
 
 	if (ends_with(binary, "/curl") || binary == "curl") {
 		let argv = [
 			binary,
 			"-sS",
 			"--http1.1",
+			"--proto", "=http,https",
+			"--proto-redir", "=http,https",
 			"--max-time", "" + timeout,
 			"--max-filesize", "" + MAX_BODY_BYTES,
 			"-D", header_path,
@@ -336,22 +386,23 @@ function http_once(target, headers, timeout, workdir) {
 		};
 	}
 
-	let argv = [
-		binary,
-		"-q",
-		"-O", body_path,
-		"--timeout=" + timeout
-	];
+	// uclient-fetch follows redirects on its own and has no size limit, so the
+	// hard cap comes from ulimit -f inside command_to_file. Its output goes to
+	// the log file; only the first lines of a failure are reported.
+	let argv = [ binary, "-q", "-O", body_path, "--timeout=" + timeout ];
 
 	for (let key in keys(headers))
 		push(argv, "--header=" + key + ": " + headers[key]);
 
 	push(argv, unwrap_app_link(target));
 
-	let result = util.command_argv(argv);
+	let result = util.command_to_file(argv, code_path, MAX_BODY_BYTES);
+
+	if (result.truncated)
+		die("subscription is too large (limit " + MAX_BODY_BYTES + " bytes)");
 
 	if (result.code != 0) {
-		let message = util.first_line(result.output);
+		let message = util.first_line(read_text(code_path));
 		die("download failed: " + (message == "" ? "uclient-fetch exited with " + result.code : message));
 	}
 
@@ -365,18 +416,40 @@ function http_once(target, headers, timeout, workdir) {
 	};
 }
 
-function fetch_follow(raw, headers, timeout, workdir, trusted) {
+// A chain of handoff pages can be made arbitrarily slow by the provider, and
+// every hop has its own per-request timeout. The overall budget bounds the
+// whole walk: no request starts after the deadline, and the remaining time is
+// passed down as the per-request timeout so a single slow hop cannot exceed it.
+// An outer caller may pass its own deadline so several walks share one budget.
+function fetch_follow(raw, headers, timeout, workdir, trusted, outer_deadline) {
 	let current = unwrap_app_link(raw);
+	let budget = max(limits.MAX_HANDOFF_SECONDS, timeout);
+	let deadline = util.now_ms() + budget * 1000;
+
+	if (outer_deadline != null && outer_deadline < deadline)
+		deadline = outer_deadline;
 
 	for (let depth = 0; depth <= MAX_REDIRECTS; depth++) {
+		let left = int((deadline - util.now_ms()) / 1000);
+		if (left < 1)
+			die("handoff pages took too long (limit " + budget + "s)");
+
 		let host = lc(url.parse(current).host);
-		let response = http_once(current, trusted_headers(headers, host, trusted), timeout, workdir);
+		let response = http_once(current, trusted_headers(headers, host, trusted), min(timeout, left), workdir);
 
 		if (response.status >= 300 && response.status < 400) {
 			if (response.location == "")
 				die("redirect from " + current + " without a Location header");
 
-			current = unwrap_app_link(url.resolve_relative(current, response.location));
+			let next = url.resolve_relative(current, response.location);
+
+			// A redirect may not downgrade the scheme or reach into the LAN;
+			// http_once re-checks too, but failing here gives a clearer error.
+			let parsed = url.parse(next);
+			if (!net.scheme_allowed(parsed.scheme))
+				die("redirect to an unsupported scheme: " + parsed.scheme);
+
+			current = unwrap_app_link(next);
 			continue;
 		}
 
@@ -493,28 +566,21 @@ function normalize_handoff_value(base_url, raw) {
 	return absolute;
 }
 
+// /g makes match() return every occurrence in one pass over the body. The
+// previous version re-matched substr(body, offset) once per hit, which is
+// quadratic on a page with many links and needs no extra memory because a
+// single pass returns only the captured groups.
 function extract_deep_link(body) {
-	let re = /[a-z][a-z0-9+.\-]*:\/\/(import-remote-profile|import|install|add)[\/?=]([^[:space:]"'<>]+)/i;
-	let matches = match(body, re);
+	let re = /[a-z][a-z0-9+.\-]*:\/\/(import-remote-profile|import|install|add)[\/?=]([^[:space:]"'<>]+)/ig;
+	let found = match(body, re);
 
-	// match() returns only the first match; scan the body in chunks so a page
-	// with several deep links still finds a usable one.
-	let offset = 0;
-	while (offset < length(body)) {
-		let m = match(substr(body, offset), re);
-		if (m == null)
-			break;
+	if (found == null)
+		return "";
 
+	for (let m in found) {
 		let inner = normalize_embedded_url(m[2]);
 		if (inner != "")
 			return inner;
-
-		let full = m[0];
-		let at = index(substr(body, offset), full);
-		if (at < 0)
-			break;
-
-		offset += at + length(full);
 	}
 
 	return "";
@@ -599,36 +665,27 @@ function extract_handoff_link(base_url, target, body) {
 		push(candidates, { url: absolute, score: handoff_score(parsed, target) });
 	}
 
-	let offset = 0;
-	while (offset < length(body)) {
-		let m = match(substr(body, offset), /href\s*=\s*["']([^"']+)["']/i);
-		if (m == null)
-			break;
+	// Both scans use /g so the body is walked once, not once per match. A page
+	// with thousands of links used to cost O(n^2) time and memory; the score
+	// only needs the best candidate, so the list is capped as well.
+	let hrefs = match(body, /href\s*=\s*["']([^"']+)["']/ig);
+	if (hrefs != null) {
+		for (let m in hrefs) {
+			if (length(candidates) >= MAX_HANDOFF_CANDIDATES)
+				break;
 
-		add(html_unescape(util.trim(m[1])), false);
-
-		let full = m[0];
-		let at = index(substr(body, offset), full);
-		if (at < 0)
-			break;
-
-		offset += at + length(full);
+			add(html_unescape(util.trim(m[1])), false);
+		}
 	}
 
-	offset = 0;
-	while (offset < length(body)) {
-		let m = match(substr(body, offset), /(location(\.href)?|window\.location)\s*=\s*["']([^"']+)["']/i);
-		if (m == null)
-			break;
+	let scripts = match(body, /(location(\.href)?|window\.location)\s*=\s*["']([^"']+)["']/ig);
+	if (scripts != null) {
+		for (let m in scripts) {
+			if (length(candidates) >= MAX_HANDOFF_CANDIDATES)
+				break;
 
-		add(html_unescape(util.trim(m[3])), true);
-
-		let full = m[0];
-		let at = index(substr(body, offset), full);
-		if (at < 0)
-			break;
-
-		offset += at + length(full);
+			add(html_unescape(util.trim(m[3])), true);
+		}
 	}
 
 	if (length(candidates) == 0)
@@ -692,6 +749,11 @@ function fetch_subscription(raw_url, headers, hwid_path, timeout, workdir) {
 	let target = presets.parse_target(url.parse(raw_url).fragment);
 	let trusted = {};
 
+	// Every attempt below (the direct ?domen= address and up to
+	// MAX_HANDOFF_DEPTH handoff pages) shares one deadline, so a provider
+	// cannot multiply the budget by making each step slow.
+	let deadline = util.now_ms() + max(limits.MAX_SUBSCRIPTION_SECONDS, timeout) * 1000;
+
 	// Only the subscription origin (and the host named by the provider in
 	// ?domen=) may receive X-HWID and custom identity headers.
 	trusted[lc(url.parse(unwrap_app_link(resolved)).host)] = true;
@@ -705,7 +767,7 @@ function fetch_subscription(raw_url, headers, hwid_path, timeout, workdir) {
 
 		if (direct != resolved) {
 			try {
-				let attempt = fetch_follow(direct, prepared, timeout, workdir, trusted);
+				let attempt = fetch_follow(direct, prepared, timeout, workdir, trusted, deadline);
 				if (!looks_like_html(attempt.body)) {
 					return { data: attempt.body, url: attempt.url, headers: prepared };
 				}
@@ -719,7 +781,7 @@ function fetch_subscription(raw_url, headers, hwid_path, timeout, workdir) {
 	let current = resolved;
 
 	for (let depth = 0; depth < MAX_HANDOFF_DEPTH; depth++) {
-		let response = fetch_follow(current, prepared, timeout, workdir, trusted);
+		let response = fetch_follow(current, prepared, timeout, workdir, trusted, deadline);
 
 		if (!looks_like_html(response.body))
 			return { data: response.body, url: response.url, headers: prepared };
@@ -746,6 +808,7 @@ return {
 	public_headers,
 	trusted_headers,
 	resolve_url,
+	assert_target_allowed,
 	fetch_follow,
 	is_blocked_host,
 	extract_domain_subscription,

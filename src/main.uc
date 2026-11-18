@@ -14,14 +14,16 @@ let output = require("output");
 let daemon = require("daemon");
 
 const VERSION_FILE = "/usr/share/subbridge/version";
-const FALLBACK_VERSION = "0.5.1";
 
+// The version is written from the VERSION file at build time, so there is
+// exactly one source. An empty read means a broken installation; reporting
+// "unknown" is better than a literal that drifts from the package metadata.
 function version() {
 	if (getenv("SUBBRIDGE_VERSION") != null && getenv("SUBBRIDGE_VERSION") != "")
 		return getenv("SUBBRIDGE_VERSION");
 
 	let value = util.trim(util.read_file(VERSION_FILE));
-	return value == "" ? FALLBACK_VERSION : value;
+	return value == "" ? "unknown" : value;
 }
 
 function info(cfg) {

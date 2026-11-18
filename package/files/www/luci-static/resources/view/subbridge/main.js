@@ -244,7 +244,8 @@ return view.extend({
 		concurrency.placeholder = '8';
 		concurrency.rmempty = true;
 		concurrency.datatype = 'range(1,32)';
-		concurrency.description = _('Больше параллельных проверок — быстрее, но больше памяти.');
+		concurrency.description = _('Больше параллельных проверок — быстрее, но больше памяти. ' +
+			'Параллельно проверяет только с curl; с uclient-fetch узлы проверяются по одному.');
 
 		var uaMap = new form.Map('subbridge', _('User Agent'), null);
 		this.uaMap = uaMap;

@@ -8,7 +8,9 @@
 //   ubus call subbridge status   read the progress document
 //   ubus call subbridge result   read the last successful result
 //   ubus call subbridge info     read settings and the detected engine
-//   ubus call subbridge save     store settings from the web form
+//
+// Settings are written by LuCI through the UCI ACL (map.save), not through a
+// ubus method, so there is no "save" call here.
 //
 // Long work happens in /usr/bin/subbridge, which owns the check lock and the
 // status/result files, so these calls return immediately and never block LuCI.
@@ -26,8 +28,10 @@ const STOP_SCRIPT = '/usr/lib/subbridge/stop.sh';
 const BIN = '/usr/bin/subbridge';
 const INIT_SCRIPT = '/etc/init.d/subbridge';
 
+// /g is required: without it only the first apostrophe is escaped and the rest
+// of the value escapes the quoted string into the shell.
 function shellquote(value) {
-	return "'" + replace('' + value, "'", "'\\''") + "'";
+	return "'" + replace('' + value, /'/g, "'\\''") + "'";
 }
 
 function trim(value) {
@@ -35,16 +39,6 @@ function trim(value) {
 		return '';
 
 	return replace(replace(value, /^\s+/, ''), /\s+$/, '');
-}
-
-/* Header values are passed to curl/uclient-fetch as separate -H arguments,
- * but a stray newline would still split them into two headers. */
-function clean_header(value) {
-	value = trim('' + (value == null ? '' : value));
-	value = replace(value, /\r/g, '');
-	value = replace(value, /\n/g, '');
-
-	return value;
 }
 
 function ensure_dir(path) {
@@ -126,9 +120,13 @@ function detect_engine() {
 	return found;
 }
 
+// The version comes from one place: /usr/share/subbridge/version, written by
+// the build from the VERSION file. A hardcoded fallback here would silently
+// drift from the package metadata, so an empty result is reported as unknown.
 function version() {
 	let value = trim(readfile('/usr/share/subbridge/version'));
-	return value == '' ? '0.5.1' : value;
+
+	return value == '' ? 'unknown' : value;
 }
 
 function engine_version(binary) {
@@ -395,13 +393,6 @@ const methods = {
 		call: set_enabled
 	},
 
-	autostart: {
-		args: {
-			enabled: 'enabled'
-		},
-		call: set_enabled
-	},
-
 	status: {
 		call: function() {
 			let cfg = settings();
@@ -431,85 +422,6 @@ const methods = {
 				},
 				settings: cfg
 			};
-		}
-	},
-
-	save: {
-		args: {
-			subscription: 'subscription',
-			engine: 'engine',
-			test_url: 'test_url',
-			timeout_ms: 'timeout_ms',
-			concurrency: 'concurrency',
-			ua_mode: 'ua_mode',
-			ua_user_agent: 'ua_user_agent',
-			ua_device_os: 'ua_device_os',
-			ua_ver_os: 'ua_ver_os',
-			ua_app_version: 'ua_app_version',
-			ua_device_model: 'ua_device_model',
-			ua_device_locale: 'ua_device_locale',
-			ua_hwid: 'ua_hwid',
-			enabled: 'enabled'
-		},
-		call: function(request) {
-			let ctx = cursor();
-			let args = request.args;
-			let subscription = trim(args.subscription || '');
-
-			if (subscription != '' &&
-			    substr(lc(subscription), 0, 7) != 'http://' &&
-			    substr(lc(subscription), 0, 8) != 'https://')
-				return { error: 'Subscription URL must start with http:// or https://' };
-
-			if (args.subscription != null)
-				ctx.set('subbridge', 'main', 'subscription', subscription);
-
-			if (args.engine != null)
-				ctx.set('subbridge', 'main', 'engine', trim(args.engine));
-
-			if (args.test_url != null)
-				ctx.set('subbridge', 'main', 'test_url', trim(args.test_url));
-
-			if (args.timeout_ms != null) {
-				let timeout = int(args.timeout_ms) || 3000;
-				if (timeout < 500) timeout = 500;
-				if (timeout > 60000) timeout = 60000;
-				ctx.set('subbridge', 'main', 'timeout_ms', '' + timeout);
-			}
-
-			if (args.concurrency != null) {
-				let workers = int(args.concurrency) || 8;
-				if (workers < 1) workers = 1;
-				if (workers > 32) workers = 32;
-				ctx.set('subbridge', 'main', 'concurrency', '' + workers);
-			}
-
-			if (args.ua_mode != null)
-				ctx.set('subbridge', 'main', 'ua_mode',
-					lc(clean_header(args.ua_mode)) == 'custom' ? 'custom' : 'auto');
-
-			for (let field in [
-				'ua_user_agent',
-				'ua_device_os',
-				'ua_ver_os',
-				'ua_app_version',
-				'ua_device_model',
-				'ua_device_locale',
-				'ua_hwid'
-			]) {
-				if (args[field] != null)
-					ctx.set('subbridge', 'main', field, clean_header(args[field]));
-			}
-
-			if (args.enabled != null) {
-				let raw = args.enabled;
-				let on = !(raw === false || raw === 0 || raw == '0' || raw == 'false' || raw == 'off');
-				ctx.set('subbridge', 'main', 'enabled', on ? '1' : '0');
-			}
-
-			ctx.commit('subbridge');
-
-			return { ok: true };
 		}
 	}
 };

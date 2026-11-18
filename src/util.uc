@@ -148,9 +148,13 @@ function json_write(path, value) {
 	return write_file(path, sprintf("%.4J\n", value), 0600);
 }
 
+// Wrap a value for /bin/sh single-quoted context. The /g flag is essential:
+// without it only the first apostrophe is escaped, so a value such as
+// "a'b'c" would terminate the quoted string early and the rest would be
+// parsed as shell code.
 function shell_quote(value) {
 	let s = "" + value;
-	return "'" + replace(s, /'/, "'\\''") + "'";
+	return "'" + replace(s, /'/g, "'\\''") + "'";
 }
 
 function argv_command(argv) {
@@ -176,6 +180,45 @@ function command(cmd) {
 
 function command_argv(argv) {
 	return command(argv_command(argv));
+}
+
+// Run argv without a shell and let the kernel cap every file it writes. curl
+// and uclient-fetch both honour --max-filesize/max-time only partially (an
+// unknown Content-Length bypasses curl's check and uclient-fetch has no size
+// limit at all), so the hard limit is ulimit -f: the kernel sends SIGXFSZ as
+// soon as the file grows past max_bytes, and a hostile server cannot fill
+// tmpfs. stdout and stderr go to log_path, which is also capped.
+//
+// Returns { code, truncated, output }.
+function command_to_file(argv, log_path, max_bytes) {
+	let quote = "";
+	for (let arg in argv)
+		quote += shell_quote(arg) + " ";
+
+	// ulimit -f counts 512-byte blocks.
+	let blocks = int((max_bytes + 511) / 512) + 1;
+	let cmd = "( ulimit -f " + blocks + " 2>/dev/null; " + quote + ") >" +
+		shell_quote(log_path) + " 2>&1";
+
+	let p = fs.popen(cmd);
+	if (!p)
+		return { code: -1, truncated: false, output: "" };
+
+	let output = p.read("all");
+	let code = p.close();
+
+	let st = fs.stat(log_path);
+
+	// SIGXFSZ (25) is how the kernel reports that a file hit ulimit -f.
+	// The size check covers clients that exit cleanly after a short write.
+	let truncated = code == -25 ||
+		(st != null && st.type == "file" && st.size >= max_bytes);
+
+	return {
+		code: code == null ? -1 : code,
+		truncated: truncated,
+		output: output == null ? "" : output
+	};
 }
 
 function first_line(value) {
@@ -327,6 +370,7 @@ return {
 	argv_command,
 	command,
 	command_argv,
+	command_to_file,
 	first_line,
 	split_lines,
 	to_int,

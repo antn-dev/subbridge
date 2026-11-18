@@ -99,6 +99,26 @@ trap 'exit 143' TERM
 
 pkg="$tmp/$ASSET"
 sums="$tmp/SHA256SUMS"
+sig="$tmp/SHA256SUMS.sig"
+pub="$tmp/subbridge.pub"
+
+# The public key is embedded here on purpose. SHA256SUMS and the package are
+# served from the same mirror, so a checksum alone proves nothing if that
+# mirror is compromised; usign verifies that the sums were signed with the
+# release key. The key is also in the README for out-of-band comparison.
+PUBKEY_BODY="RWT0QqF55t8RovTA18CszEqopajki6Do6snM8GoKiec0DU9S1a7iFOAR"
+
+printf 'untrusted comment: SubBridge release key\n%s\n' "$PUBKEY_BODY" >"$pub"
+
+# usign ships in both 24.10 and 25.12 base systems. When it is missing the
+# script says so once and falls back to checksum-only verification, which is
+# weaker but still catches a corrupted download.
+have_usign=0
+if command -v usign >/dev/null 2>&1; then
+	have_usign=1
+else
+	log "SubBridge: usign не найден — подпись не будет проверена"
+fi
 
 found=0
 for base in $BASES; do
@@ -106,6 +126,22 @@ for base in $BASES; do
 
 	if ! fetch "$base/SHA256SUMS" "$sums"; then
 		continue
+	fi
+
+	if [ "$have_usign" = "1" ]; then
+		if ! fetch "$base/SHA256SUMS.sig" "$sig"; then
+			log "SubBridge: нет подписи на $base"
+			rm -f "$sums"
+			continue
+		fi
+
+		if ! usign -V -q -p "$pub" -m "$sums" -x "$sig"; then
+			log "SubBridge: подпись не прошла проверку на $base"
+			rm -f "$sums" "$sig"
+			continue
+		fi
+
+		log "SubBridge: подпись OK ($base)"
 	fi
 
 	want="$(awk -v name="$ASSET" '$2 == name { print $1; exit }' "$sums")"
@@ -123,14 +159,17 @@ for base in $BASES; do
 	fi
 
 	log "SubBridge: контрольная сумма не совпала на $base"
-	rm -f "$pkg" "$sums"
+	rm -f "$pkg" "$sums" "$sig"
 done
 
 [ "$found" = "1" ] || die "не удалось скачать $ASSET ни с одного зеркала"
 
+# A stale package list makes the dependency install fail on a fresh router.
 if [ "$ASSET" = "subbridge_latest_all.apk" ]; then
+	apk update >/dev/null 2>&1 || true
 	apk add --allow-untrusted --force-non-repository "$pkg" || die "apk add завершился с ошибкой"
 else
+	opkg update >/dev/null 2>&1 || true
 	opkg install "$pkg" || die "opkg install завершился с ошибкой"
 fi
 

@@ -3,3 +3,6 @@ dist/
 *.apk
 *.tar.gz
 .DS_Store
+
+# Release signing key. The public half is committed; the secret half never is.
+*.sec

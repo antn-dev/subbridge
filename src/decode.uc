@@ -10,8 +10,7 @@ function looks_like_plain_text(value) {
 	let s = lc(util.trim(value));
 
 	return substr(s, 0, 1) == "{" ||
-		substr(s, 0, 8) == "[" ||
-		false;
+		substr(s, 0, 1) == "[";
 }
 
 function plain_prefix(value) {
@@ -26,8 +25,11 @@ function plain_prefix(value) {
 		substr(l, 0, 5) == "ss://";
 }
 
+// Panels wrap Base64 at 76 columns and some use the URL-safe alphabet, so the
+// replacements have to cover the whole string. A regex without /g would only
+// rewrite the first line break and leave the payload undecodable.
 function pad_base64(value) {
-	let s = replace(replace(replace("" + value, /\s+/, ""), /-/, "+"), /_/, "/");
+	let s = replace(replace(replace("" + value, /\s+/g, ""), /-/g, "+"), /_/g, "/");
 	let remainder = length(s) % 4;
 
 	if (remainder == 2)

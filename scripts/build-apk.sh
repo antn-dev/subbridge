@@ -168,4 +168,11 @@ SOURCE_DATE_EPOCH=0 "$APK_TOOL" mkpkg \
 	--files "$DATA" \
 	--output "$DIST/$NAME"
 
+# A silent mkpkg failure must not look like a successful build: the publishing
+# step reads this file by name.
+[ -s "$DIST/$NAME" ] || {
+	echo "error: $DIST/$NAME was not created" >&2
+	exit 1
+}
+
 echo "built: dist/$NAME"

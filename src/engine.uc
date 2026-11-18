@@ -283,21 +283,24 @@ function check_config(binary, path) {
 
 function parse_rejected_index(output) {
 	let text = strip_ansi(output);
-	let index = -1;
+	// Do not name this "index": ucode resolves the built-in index() function
+	// and a local of the same name shadows it, which turns the parser into
+	// "left-hand side is not a function" and aborts the whole check.
+	let position = -1;
 	let marker_len = 0;
 
 	for (let marker in ["outbounds[", "outbound["]) {
 		let found = index(text, marker);
-		if (found >= 0 && (index < 0 || found < index)) {
-			index = found;
+		if (found >= 0 && (position < 0 || found < position)) {
+			position = found;
 			marker_len = length(marker);
 		}
 	}
 
-	if (index < 0)
+	if (position < 0)
 		return -1;
 
-	let rest = substr(text, index + marker_len);
+	let rest = substr(text, position + marker_len);
 	let end = index(rest, "]");
 	if (end < 0)
 		return -1;
@@ -420,29 +423,23 @@ function wait_ready(port, pid, log_path) {
 	die("sing-box did not expose the Clash API in " + (START_TIMEOUT_MS / 1000) + "s: " + tail(log_path, MAX_LOG_TAIL));
 }
 
-function start(binary, support, endpoints) {
-	let dir = util.temp_dir("subbridge-check");
-	let config_path = dir + "/config.json";
-	let log_path = dir + "/engine.log";
-
+// Build, validate and launch the engine. Cleanup of the working directory is
+// the caller's job (see start()), so every failure path — including an
+// exception from launch() or wait_ready() — leaves the directory removed.
+function start_engine(binary, support, endpoints, dir, config_path, log_path) {
 	let port = free_port();
-	if (port <= 0) {
-		util.command("rm -rf " + util.shell_quote(dir));
+	if (port <= 0)
 		die("cannot pick a Clash API port");
-	}
 
 	let kept = [];
 	for (let i = 0; i < length(endpoints); i++)
 		push(kept, i);
 
 	let dropped = {};
-	let tags = [];
 
 	for (let attempt = 0; attempt <= length(endpoints); attempt++) {
-		if (length(kept) == 0) {
-			util.command("rm -rf " + util.shell_quote(dir));
+		if (length(kept) == 0)
 			return { kept: [], tags: [], dropped: dropped, port: 0, pid: 0, dir: dir, binary: binary };
-		}
 
 		let subset = [];
 		for (let index in kept)
@@ -453,17 +450,13 @@ function start(binary, support, endpoints) {
 
 		let checked = check_config(binary, config_path);
 		if (checked.ok) {
-			let pid = 0;
+			let pid = launch(binary, config_path, log_path);
 
 			try {
-				pid = launch(binary, config_path, log_path);
 				wait_ready(port, pid, log_path);
 			}
 			catch (e) {
-				if (pid > 0)
-					stop_process(pid);
-
-				util.command("rm -rf " + util.shell_quote(dir));
+				stop_process(pid);
 				die(e);
 			}
 
@@ -479,20 +472,16 @@ function start(binary, support, endpoints) {
 		}
 
 		let rejected = parse_rejected_index(checked.output);
-		if (rejected < 0 || rejected >= length(kept)) {
-			util.command("rm -rf " + util.shell_quote(dir));
+		if (rejected < 0 || rejected >= length(kept))
 			die("engine rejected the configuration: " + first_error_line(checked.output));
-		}
 
 		let original = kept[rejected];
 		dropped[original] = "engine rejected the endpoint: " + first_error_line(checked.output);
 
 		// Rebuilding the whole configuration for every rejected endpoint is
 		// expensive; a broken subscription must not turn into an O(N^2) loop.
-		if (length(keys(dropped)) > limits.MAX_REJECTED_ENDPOINTS) {
-			util.command("rm -rf " + util.shell_quote(dir));
+		if (length(keys(dropped)) > limits.MAX_REJECTED_ENDPOINTS)
 			die("engine rejected too many endpoints (limit " + limits.MAX_REJECTED_ENDPOINTS + ")");
-		}
 
 		// Remove the rejected entry; the next config uses the remaining ones.
 		let next = [];
@@ -507,9 +496,22 @@ function start(binary, support, endpoints) {
 	for (let index in kept)
 		dropped[index] = "engine kept rejecting this endpoint";
 
-	util.command("rm -rf " + util.shell_quote(dir));
-
 	return { kept: [], tags: [], dropped: dropped, port: 0, pid: 0, dir: dir, binary: binary };
+}
+
+function start(binary, support, endpoints) {
+	let dir = util.temp_dir("subbridge-check");
+
+	try {
+		return start_engine(binary, support, endpoints, dir,
+			dir + "/config.json", dir + "/engine.log");
+	}
+	catch (e) {
+		// The config contains endpoint UUIDs, so it must never survive a
+		// failed start in /tmp.
+		util.remove_dir(dir);
+		die(e);
+	}
 }
 
 function close(engine) {
@@ -561,10 +563,13 @@ function parse_delay(path) {
 
 function run_sequential(binary, jobs, port, target, timeout_ms, dir) {
 	let out = {};
+	// uclient-fetch --timeout is in SECONDS while the delay budget is in
+	// milliseconds; passing the raw value made every request wait 5000 s.
+	let timeout_s = int((timeout_ms + 999) / 1000) + 2;
 
 	for (let i = 0; i < length(jobs); i++) {
 		let path = dir + "/r" + i;
-		let argv = [binary, "-q", "-O", path, "--timeout=" + (timeout_ms + 2000), delay_url(port, jobs[i].tag, target, timeout_ms)];
+		let argv = [binary, "-q", "-O", path, "--timeout=" + timeout_s, delay_url(port, jobs[i].tag, target, timeout_ms)];
 		util.command_argv(argv);
 		out[jobs[i].tag] = parse_delay(path);
 	}

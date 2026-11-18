@@ -62,6 +62,11 @@ equal("to_int fallback", util.to_int("not a number", 7), 7);
 equal("to_bool yes", util.to_bool("yes"), true);
 equal("to_bool off", util.to_bool("off"), false);
 equal("shell_quote", util.shell_quote("a'b"), "'a'\\''b'");
+// Regression: without /g only the first apostrophe was escaped, so the rest of
+// the value escaped the quoted string and became shell code.
+equal("shell_quote escapes every quote", util.shell_quote("a'b'c"), "'a'\\''b'\\''c'");
+equal("shell_quote keeps plain value", util.shell_quote("plain value"), "'plain value'");
+equal("shell_quote empty", util.shell_quote(""), "''");
 equal("split_lines", sprintf("%J", util.split_lines("a\r\nb\n")), "[ \"a\", \"b\", \"\" ]");
 contains("first_line", util.first_line("\n  sing-box version 1.14\n"), "sing-box version 1.14");
 equal("random_hex length", length(util.random_hex(8)), 16);
@@ -111,6 +116,21 @@ equal("decode padded", decode.decode(b64enc(payload)), payload);
 let unpadded = replace(b64enc(payload), /=+$/, "");
 equal("decode unpadded", decode.decode(unpadded), payload);
 check("plain prefix", decode.plain_prefix("vless://abc") == true);
+
+// Regression: pad_base64 used regexes without /g, so a wrapped payload kept
+// its line breaks (and URL-safe '-'/'_' were only fixed in the first place).
+let wrapped = b64enc(payload);
+wrapped = substr(wrapped, 0, 8) + "\n" + substr(wrapped, 8);
+equal("decode wrapped base64", decode.decode(wrapped), payload);
+
+let urlsafe = replace(replace(b64enc("{\"remarks\":\"?~>\"}"), /\+/g, "-"), /\//g, "_");
+equal("decode url-safe base64", decode.decode(urlsafe), "{\"remarks\":\"?~>\"}");
+
+// The old implementation compared an 8-character prefix with "[" and could
+// therefore never be true for an array.
+check("plain text array", decode.looks_like_plain_text("[1,2]") == true);
+check("plain text object", decode.looks_like_plain_text("{\"a\":1}") == true);
+check("plain text base64", decode.looks_like_plain_text("eyJhIjoxfQ==") == false);
 
 // --- presets ---------------------------------------------------------------
 
@@ -256,6 +276,73 @@ for (let i = 0; i < 600; i++)
 dies("oversized profile rejected", function() {
 	parse.parse("[{\"remarks\":\"" + big_profile + "\",\"outbounds\":[]}]");
 }, "profile is too large");
+
+// --- net -------------------------------------------------------------------
+
+let net = require("net");
+
+check("loopback blocked", net.blocked_address("127.0.0.1") == true);
+check("private 10/8 blocked", net.blocked_address("10.1.2.3") == true);
+check("private 172.16/12 blocked", net.blocked_address("172.16.0.1") == true);
+check("public 172.32 allowed", net.blocked_address("172.32.0.1") == false);
+check("private 192.168/16 blocked", net.blocked_address("192.168.1.1") == true);
+check("link-local blocked", net.blocked_address("169.254.1.1") == true);
+check("cgnat blocked", net.blocked_address("100.64.0.1") == true);
+check("broadcast blocked", net.blocked_address("255.255.255.255") == true);
+check("public v4 allowed", net.blocked_address("1.1.1.1") == false);
+check("ipv6 loopback blocked", net.blocked_address("::1") == true);
+check("ipv6 link-local blocked", net.blocked_address("fe80::1") == true);
+check("ipv6 ula blocked", net.blocked_address("fd00::1") == true);
+check("ipv6 mapped loopback blocked", net.blocked_address("::ffff:127.0.0.1") == true);
+check("ipv6 public allowed", net.blocked_address("2606:4700::1111") == false);
+
+// Regression: the first version compared IPv6 as text, so an uncompressed
+// loopback address ("0:0:0:0:0:0:0:1") was treated as public.
+check("ipv6 loopback uncompressed", net.blocked_address("0:0:0:0:0:0:0:1") == true);
+check("ipv6 loopback padded", net.blocked_address("0000:0000:0000:0000:0000:0000:0000:0001") == true);
+check("ipv6 unspecified", net.blocked_address("::") == true);
+check("ipv6 link-local full", net.blocked_address("fe80:0:0:0:0:0:0:1") == true);
+check("ipv6 link-local upper bound", net.blocked_address("febf::1") == true);
+check("ipv6 fec0 allowed", net.blocked_address("fec0::1") == false);
+check("ipv6 ula full", net.blocked_address("fd00:0:0:0:0:0:0:1") == true);
+check("ipv6 ula fc00", net.blocked_address("fc00::1") == true);
+check("ipv6 multicast blocked", net.blocked_address("ff02::1") == true);
+check("ipv6 documentation blocked", net.blocked_address("2001:db8::1") == true);
+check("ipv6 discard blocked", net.blocked_address("100::1") == true);
+check("ipv6 zone id blocked", net.blocked_address("fe80::1%eth0") == true);
+
+// An embedded IPv4 address is what the router actually reaches, in every
+// transition prefix.
+check("ipv6 mapped public allowed", net.blocked_address("::ffff:1.1.1.1") == false);
+check("ipv6 mapped private blocked", net.blocked_address("::ffff:10.0.0.1") == true);
+check("ipv6 mapped hex loopback blocked", net.blocked_address("::ffff:7f00:1") == true);
+check("ipv6 nat64 public allowed", net.blocked_address("64:ff9b::1.1.1.1") == false);
+check("ipv6 nat64 private blocked", net.blocked_address("64:ff9b::10.0.0.1") == true);
+check("6to4 private blocked", net.blocked_address("2002:0a00:0001::1") == true);
+check("6to4 public allowed", net.blocked_address("2002:0101:0101::1") == false);
+
+// An address that looks like IPv6 but does not parse is blocked rather than
+// assumed public: the kernel may still connect to it.
+check("malformed ipv6 blocked", net.blocked_address("1:::2") == true);
+check("ipv6 with five colons blocked", net.blocked_address(":::::") == true);
+
+// Integer and octal spellings are not IPv4 literals for the resolver either,
+// so they must not be accepted as one.
+check("decimal integer not ipv4", net.is_ipv4("2130706433") == false);
+check("octal not ipv4", net.is_ipv4("0177.0.0.1") == false);
+check("hex not ipv4", net.is_ipv4("0x7f000001") == false);
+
+check("localhost host blocked", net.host_blocked("localhost") == true);
+check("mDNS host blocked", net.host_blocked("printer.local") == true);
+check("internal zone blocked", net.host_blocked("router.internal") == true);
+check("public host allowed", net.host_blocked("sub.example.com") == false);
+check("host with port blocked", net.host_blocked("127.0.0.1:8080") == true);
+check("bracketed ipv6 blocked", net.host_blocked("[::1]") == true);
+
+check("file scheme rejected", net.scheme_allowed("file") == false);
+check("gopher scheme rejected", net.scheme_allowed("gopher") == false);
+check("http scheme allowed", net.scheme_allowed("HTTP") == true);
+check("https scheme allowed", net.scheme_allowed("https") == true);
 
 // --- result ----------------------------------------------------------------
 
